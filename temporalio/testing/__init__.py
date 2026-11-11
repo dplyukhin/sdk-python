@@ -8,6 +8,7 @@ from ._workflow_check import (
     WorkflowChecker,
     WorkflowCheckResult,
     WorkflowCheckSignal,
+    WorkflowCheckSpec,
 )
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "WorkflowChecker",
     "WorkflowCheckResult",
     "WorkflowCheckSignal",
+    "WorkflowCheckSpec",
     "TimeSkippingConfig",
 ]

@@ -611,6 +611,7 @@ impl WorkflowCheckRef {
         max_checks: usize,
         timeout_millis: u64,
         task_timeout_millis: u64,
+        collect_histories: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.runtime.assert_same_process("check workflow")?;
         let start = WorkflowExecutionStartedEventAttributes::decode(start)
@@ -653,8 +654,9 @@ impl WorkflowCheckRef {
                 .await
                 .take()
                 .ok_or_else(|| PyRuntimeError::new_err("Workflow checker already used"))?;
+            let mut histories = Vec::new();
             let result = checker
-                .run(
+                .run_with_history_callback(
                     &workflow_id,
                     initial,
                     &CheckInputs {
@@ -668,10 +670,21 @@ impl WorkflowCheckRef {
                         timeout: Duration::from_millis(timeout_millis),
                         task_timeout: Duration::from_millis(task_timeout_millis),
                     },
+                    |history| {
+                        if collect_histories {
+                            histories.push(history.encode_to_vec());
+                        }
+                    },
                 )
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(result.map(|r| (r.history.encode_to_vec(), r.failure.encode_to_vec())))
+                .await;
+            let (counterexample, error) = match result {
+                Ok(result) => (
+                    result.map(|r| (r.history.encode_to_vec(), r.failure.encode_to_vec())),
+                    None,
+                ),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            Ok((counterexample, histories, error))
         })
     }
 }

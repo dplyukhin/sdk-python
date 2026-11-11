@@ -1,0 +1,1 @@
+Experimental workflow checking can export explored frontier and completed-task histories through an optional callback or a serverless command-line runner, preserving successful paths and counterexamples as replayable JSON with a corpus manifest.

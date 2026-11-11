@@ -63,6 +63,42 @@ class WorkflowCheckActivity:
 
 
 @dataclass(frozen=True)
+class WorkflowCheckSpec:
+    """Workflow and generated inputs for the history-export command.
+
+    Used by ``python -m temporalio.testing.workflow_check module:checks``.
+    Each referenced object can be one spec or a sequence of specs. Input defaults
+    and overrides have the same meaning as :py:meth:`WorkflowChecker.check_workflow`.
+    """
+
+    workflow: type
+    """Decorated workflow implementation."""
+
+    arg: hypothesis.strategies.SearchStrategy[Any] | None = None
+    """Strategy for one start argument."""
+
+    args: hypothesis.strategies.SearchStrategy[tuple[Any, ...]] | None = None
+    """Strategy for positional start argument tuples."""
+
+    signals: Sequence[WorkflowCheckSignal] | None = None
+    """Signal inputs, inferred when omitted."""
+
+    activities: Sequence[WorkflowCheckActivity] = ()
+    """Registered activities and outcome overrides."""
+
+    workflow_cancellation: bool = False
+    """Whether to explore external workflow cancellation."""
+
+    namespace: str = "WorkflowCheckNamespace"
+    """Namespace used during checking and later replay."""
+
+    data_converter: temporalio.converter.DataConverter = (
+        temporalio.converter.DataConverter.default
+    )
+    """Converter matching the workflow's production configuration."""
+
+
+@dataclass(frozen=True)
 class WorkflowCheckResult:
     """The first counterexample, or empty fields if none was found within the bounds.
 
@@ -143,6 +179,7 @@ class WorkflowChecker:
         max_checks: int = 1_000,
         timeout: timedelta = timedelta(seconds=30),
         task_timeout: timedelta = timedelta(seconds=10),
+        on_history: Callable[[temporalio.client.WorkflowHistory], None] | None = None,
     ) -> WorkflowCheckResult:
         """Explore schedules for generated start arguments.
 
@@ -173,6 +210,12 @@ class WorkflowChecker:
                 rounded up to milliseconds.
             task_timeout: Wall-clock limit for one task, including replay,
                 rounded up to milliseconds.
+            on_history: Optional callback receiving each submitted frontier and
+                each successfully committed task history, including terminal events.
+                Called in exploration order after each sampled start's search ends,
+                including before reporting a model error. Unevaluated queued branches
+                are not included. Histories are buffered in memory for one start only
+                when a callback is supplied. Callback exceptions stop the check.
 
         Returns:
             History and exception for the first task failure or timeout. Otherwise,
@@ -337,6 +380,7 @@ class WorkflowChecker:
                 max_checks,
                 timeout_millis,
                 task_timeout_millis,
+                on_history,
             )
             if result.exception is not None:
                 return result
@@ -355,6 +399,7 @@ class WorkflowChecker:
         max_checks: int,
         timeout_millis: int,
         task_timeout_millis: int,
+        on_history: Callable[[temporalio.client.WorkflowHistory], None] | None,
     ) -> WorkflowCheckResult:
         def on_eviction(
             _run_id: str,
@@ -380,6 +425,7 @@ class WorkflowChecker:
                     max_checks,
                     timeout_millis,
                     task_timeout_millis,
+                    on_history is not None,
                 )
             )
             await asyncio.wait(
@@ -387,7 +433,19 @@ class WorkflowChecker:
             )
             if worker_task.done():
                 await worker_task
-            result = await check_task
+            result, histories, error = await check_task
+            if on_history is not None:
+                for encoded_history in histories:
+                    on_history(
+                        temporalio.client.WorkflowHistory(
+                            workflow_id,
+                            temporalio.api.history.v1.History.FromString(
+                                encoded_history
+                            ).events,
+                        )
+                    )
+            if error is not None:
+                raise RuntimeError(error)
             if result is None:
                 return WorkflowCheckResult()
             history, failure = result

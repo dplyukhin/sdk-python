@@ -105,6 +105,7 @@ from ._workflow import (
     WorkflowExecutionAsyncIterator,
     WorkflowExecutionCount,
     WorkflowHandle,
+    WorkflowHistory,
     WorkflowUpdateHandle,
     WorkflowUpdateStage,
 )
@@ -417,6 +418,7 @@ class Client:
         max_checks: int = 1_000,
         timeout: timedelta = timedelta(seconds=30),
         task_timeout: timedelta = timedelta(seconds=10),
+        on_history: Callable[[WorkflowHistory], None] | None = None,
     ) -> temporalio.testing.WorkflowCheckResult:
         """Experimentally check generated schedules without using the connected server.
 
@@ -442,6 +444,7 @@ class Client:
             max_checks=max_checks,
             timeout=timeout,
             task_timeout=task_timeout,
+            on_history=on_history,
         )
 
     # Overload for no-param workflow
