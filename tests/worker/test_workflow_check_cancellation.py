@@ -153,7 +153,7 @@ async def test_check_activity_cancellation_races_completion_and_timer(
         workflows=[ActivityCancellationRace]
     ).check_workflow(
         ActivityCancellationRace.run,
-        args=[int(cancellation_type), False],
+        args=st.just((int(cancellation_type), False)),
         activities=[
             temporalio.testing.WorkflowCheckActivity(
                 cancellation_activity, result=st.just(1)
@@ -208,7 +208,7 @@ async def test_check_activity_cancellation_acknowledgments(
         workflows=[ActivityCancellationRace]
     ).check_workflow(
         ActivityCancellationRace.run,
-        args=[int(cancellation_type), True],
+        args=st.just((int(cancellation_type), True)),
         activities=[
             temporalio.testing.WorkflowCheckActivity(
                 cancellation_activity, result=st.just(1)
@@ -328,7 +328,7 @@ async def test_check_workflow_cancellation_is_not_a_counterexample(
         workflows=[WorkflowCancellationOutcome]
     ).check_workflow(
         WorkflowCancellationOutcome.run,
-        suppress,
+        st.just(suppress),
         workflow_cancellation=True,
         max_depth=3,
     )

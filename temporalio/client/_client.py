@@ -110,6 +110,8 @@ from ._workflow import (
 )
 
 if TYPE_CHECKING:
+    import hypothesis.strategies
+
     import temporalio.testing
 
     from ._interceptor import Interceptor
@@ -403,11 +405,11 @@ class Client:
     async def check_workflow(
         self,
         workflow: str | Callable[..., Awaitable[Any]],
-        arg: Any = temporalio.common._arg_unset,
+        arg: hypothesis.strategies.SearchStrategy[Any] | None = None,
         *,
-        args: Sequence[Any] = (),
+        args: hypothesis.strategies.SearchStrategy[tuple[Any, ...]] | None = None,
         workflows: Sequence[type],
-        signals: Sequence[temporalio.testing.WorkflowCheckSignal] = (),
+        signals: Sequence[temporalio.testing.WorkflowCheckSignal] | None = None,
         activities: Sequence[temporalio.testing.WorkflowCheckActivity] = (),
         workflow_cancellation: bool = False,
         samples_per_strategy: int = 3,

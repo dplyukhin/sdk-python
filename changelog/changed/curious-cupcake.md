@@ -1,0 +1,1 @@
+Experimental workflow checking now accepts Hypothesis strategies for start arguments instead of concrete values, with type-derived defaults for start arguments, signals, and registered activity results. Search bounds apply independently to each sampled start.

@@ -11,6 +11,7 @@ import pytest
 
 import temporalio.activity
 import temporalio.api.common.v1
+import temporalio.api.history.v1
 import temporalio.bridge.proto.workflow_activation
 import temporalio.bridge.proto.workflow_completion
 import temporalio.bridge.worker
@@ -385,13 +386,13 @@ async def test_check_workflow_activity_failures_require_terminal_outcomes() -> N
     assert result.exception is None
 
 
-async def test_check_workflow_requires_an_activity_outcome_strategy() -> None:
+async def test_check_workflow_named_activity_requires_an_outcome_strategy() -> None:
     with pytest.raises(ValueError, match="result or failure"):
         await temporalio.testing.WorkflowChecker(
             workflows=[ActivityWorkflow]
         ).check_workflow(
             ActivityWorkflow.run,
-            activities=[temporalio.testing.WorkflowCheckActivity(forbidden_activity)],
+            activities=[temporalio.testing.WorkflowCheckActivity("forbidden_activity")],
         )
 
 
@@ -448,7 +449,7 @@ async def test_check_workflow_versioned_order_approval(
         workflows=[OrderApprovalWorkflow]
     ).check_workflow(
         OrderApprovalWorkflow.run,
-        "order-123",
+        st.just("order-123"),
         signals=[
             temporalio.testing.WorkflowCheckSignal(
                 OrderApprovalWorkflow.revoke, args=st.tuples()
@@ -545,7 +546,7 @@ async def test_check_workflow_backtracks_and_returns_reproducible_history(
     # Initial task and timer-first branch succeed; the third frontier is its signal-first sibling.
     limited = await client.check_workflow(
         TimerSignalRace.run,
-        "bad",
+        st.just("bad"),
         workflows=[TimerSignalRace],
         signals=[signal],
         max_checks=2,
@@ -553,7 +554,7 @@ async def test_check_workflow_backtracks_and_returns_reproducible_history(
     assert limited.history is None
     result = await client.check_workflow(
         TimerSignalRace.run,
-        "bad",
+        st.just("bad"),
         workflows=[TimerSignalRace],
         signals=[signal],
         max_checks=3,
@@ -628,7 +629,7 @@ async def test_check_workflow_samples_signal_arguments() -> None:
         workflows=[TimerSignalRace]
     ).check_workflow(
         TimerSignalRace.run,
-        "bad",
+        st.just("bad"),
         signals=[
             temporalio.testing.WorkflowCheckSignal(
                 TimerSignalRace.set_value,
@@ -911,7 +912,9 @@ async def test_check_workflow_overall_timeout_is_not_a_counterexample() -> None:
 async def test_check_workflow_checks_the_initial_task_at_depth_zero() -> None:
     result = await temporalio.testing.WorkflowChecker(
         workflows=[InitialFailure]
-    ).check_workflow(InitialFailure.run, "initial failure", max_depth=0, max_checks=1)
+    ).check_workflow(
+        InitialFailure.run, st.just("initial failure"), max_depth=0, max_checks=1
+    )
     assert result.exception is not None
     assert "initial failure" in str(result.exception)
     assert result.history is not None
@@ -948,3 +951,193 @@ async def test_check_workflow_cancellation_cleans_up(
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@temporalio.workflow.defn
+class GeneratedStartWorkflow:
+    @temporalio.workflow.run
+    async def run(self, fail: bool) -> None:
+        await temporalio.workflow.sleep(1)
+        assert not fail, "generated start failed"
+
+
+@temporalio.workflow.defn
+class UntypedStartWorkflow:
+    @temporalio.workflow.run
+    async def run(self, value) -> None:
+        assert value != "bad", "explicit untyped input"
+
+
+@temporalio.activity.defn
+async def forbidden_bool_activity() -> bool:
+    raise AssertionError("Activity implementations must not execute")
+
+
+@temporalio.workflow.defn
+class InferredOutcomeWorkflow:
+    def __init__(self) -> None:
+        self.signal_value: bool | None = None
+
+    @temporalio.workflow.run
+    async def run(self) -> None:
+        result = await temporalio.workflow.execute_activity(
+            forbidden_bool_activity, start_to_close_timeout=timedelta(seconds=1)
+        )
+        await temporalio.workflow.wait_condition(lambda: self.signal_value is not None)
+        assert not (result and self.signal_value), "inferred activity and signal"
+
+    @temporalio.workflow.signal
+    def set_value(self, value: bool) -> None:
+        self.signal_value = value
+
+
+@pytest.mark.parametrize("mode", ["inferred", "name", "arg", "args"])
+async def test_check_workflow_explores_generated_starts(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    starts: list[bool] = []
+    original = temporalio.testing.WorkflowChecker._check_start
+
+    async def record_start(
+        self: temporalio.testing.WorkflowChecker,
+        workflow_id: str,
+        start: bytes,
+        *args: Any,
+    ) -> temporalio.testing.WorkflowCheckResult:
+        attributes = temporalio.api.history.v1.WorkflowExecutionStartedEventAttributes.FromString(
+            start
+        )
+        [value] = await temporalio.converter.DataConverter.default.decode(
+            attributes.input.payloads
+        )
+        starts.append(value)
+        return await original(self, workflow_id, start, *args)
+
+    monkeypatch.setattr(
+        temporalio.testing.WorkflowChecker, "_check_start", record_start
+    )
+    checker = temporalio.testing.WorkflowChecker(workflows=[GeneratedStartWorkflow])
+    options: dict[str, Any] = {}
+    if mode == "arg":
+        options["arg"] = st.booleans()
+    elif mode == "args":
+        options["args"] = st.tuples(st.booleans())
+    result = await checker.check_workflow(
+        "GeneratedStartWorkflow" if mode == "name" else GeneratedStartWorkflow.run,
+        samples_per_strategy=10,
+        max_depth=1,
+        max_checks=2,
+        **options,
+    )
+    assert starts == [False, True]
+    assert result.exception is not None
+    assert "generated start failed" in str(result.exception)
+    assert result.history is not None
+    [value] = await temporalio.converter.DataConverter.default.decode(
+        result.history.events[
+            0
+        ].workflow_execution_started_event_attributes.input.payloads
+    )
+    assert value is True
+    replay = await temporalio.worker.Replayer(
+        workflows=[GeneratedStartWorkflow]
+    ).replay_workflow(result.history, raise_on_replay_failure=False)
+    assert replay.replay_failure is None
+
+
+async def test_check_workflow_deduplicates_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = temporalio.testing._workflow_check._sample
+    calls = 0
+
+    def duplicates(strategy: st.SearchStrategy[Any], count: int) -> list[Any]:
+        return original(strategy, count) * 3
+
+    original_check = temporalio.testing.WorkflowChecker._check_start
+
+    async def record_check(
+        self: temporalio.testing.WorkflowChecker, *args: Any
+    ) -> temporalio.testing.WorkflowCheckResult:
+        nonlocal calls
+        calls += 1
+        return await original_check(self, *args)
+
+    monkeypatch.setattr(temporalio.testing._workflow_check, "_sample", duplicates)
+    monkeypatch.setattr(
+        temporalio.testing.WorkflowChecker, "_check_start", record_check
+    )
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[GeneratedStartWorkflow]
+    ).check_workflow(GeneratedStartWorkflow.run, st.just(False))
+    assert result.exception is None
+    assert calls == 1
+
+
+async def test_check_workflow_infers_signal_and_activity_strategies() -> None:
+    signal_result = await temporalio.testing.WorkflowChecker(
+        workflows=[RepeatedSignal]
+    ).check_workflow(RepeatedSignal.run)
+    assert signal_result.exception is not None
+    assert "third signal" in str(signal_result.exception)
+
+    disabled = await temporalio.testing.WorkflowChecker(
+        workflows=[RepeatedSignal]
+    ).check_workflow(RepeatedSignal.run, signals=[])
+    assert disabled.exception is None
+
+    activity_result = await temporalio.testing.WorkflowChecker(
+        workflows=[NoneActivityWorkflow]
+    ).check_workflow(
+        NoneActivityWorkflow.run,
+        activities=[temporalio.testing.WorkflowCheckActivity(forbidden_none_activity)],
+    )
+    assert activity_result.exception is not None
+    assert "received generated None" in str(activity_result.exception)
+
+
+async def test_check_workflow_infers_typed_signal_arguments_and_activity_results() -> (
+    None
+):
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[InferredOutcomeWorkflow]
+    ).check_workflow(
+        InferredOutcomeWorkflow.run,
+        activities=[temporalio.testing.WorkflowCheckActivity(forbidden_bool_activity)],
+        samples_per_strategy=10,
+        max_depth=2,
+    )
+    assert result.exception is not None
+    assert "inferred activity and signal" in str(result.exception)
+
+
+async def test_check_workflow_inference_requires_types_but_allows_overrides() -> None:
+    checker = temporalio.testing.WorkflowChecker(workflows=[UntypedStartWorkflow])
+    with pytest.raises(ValueError, match="missing type annotation.*explicit strategy"):
+        await checker.check_workflow(UntypedStartWorkflow.run)
+    result = await checker.check_workflow(UntypedStartWorkflow.run, st.just("bad"))
+    assert result.exception is not None
+    assert "explicit untyped input" in str(result.exception)
+
+
+def test_check_workflow_unsupported_annotation_requires_an_override() -> None:
+    with pytest.raises(ValueError, match="Cannot infer.*explicit strategy"):
+        temporalio.testing._workflow_check._type_strategy(Any, "test input")
+
+
+async def test_check_workflow_rejects_concrete_or_conflicting_start_arguments() -> None:
+    checker = temporalio.testing.WorkflowChecker(workflows=[GeneratedStartWorkflow])
+    with pytest.raises(TypeError, match="Hypothesis strategy"):
+        await checker.check_workflow(
+            GeneratedStartWorkflow.run,
+            False,  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="must generate tuples"):
+        await checker.check_workflow(
+            GeneratedStartWorkflow.run,
+            args=st.booleans(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="both arg and args"):
+        await checker.check_workflow(
+            GeneratedStartWorkflow.run, st.just(False), args=st.tuples()
+        )
