@@ -1,0 +1,1 @@
+Experimental workflow checking accepts Hypothesis strategies for signal arguments and remote activity results, exploring small sampled payload sets without executing activity functions. Counterexample histories retain the generated payloads for replay without fresh draws.

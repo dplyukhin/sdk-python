@@ -5,7 +5,7 @@ use prost::Message;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -13,6 +13,7 @@ use temporalio_common::protos::coresdk::workflow_completion::WorkflowActivationC
 use temporalio_common::protos::coresdk::{
     nexus::NexusTaskCompletion, ActivityHeartbeat, ActivityTaskCompletion,
 };
+use temporalio_common::protos::temporal::api::common::v1::Payloads;
 use temporalio_common::protos::temporal::api::history::v1::{
     History, WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
 };
@@ -602,6 +603,7 @@ impl WorkflowCheckRef {
         workflow_id: String,
         start: &[u8],
         signals: Vec<Vec<u8>>,
+        activity_results: BTreeMap<String, Vec<Vec<u8>>>,
         max_depth: usize,
         max_checks: usize,
         timeout_millis: u64,
@@ -617,6 +619,17 @@ impl WorkflowCheckRef {
             .map(|s| WorkflowExecutionSignaledEventAttributes::decode(s.as_slice()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let activity_results = activity_results
+            .into_iter()
+            .map(|(name, samples)| {
+                let samples = samples
+                    .iter()
+                    .map(|s| Payloads::decode(s.as_slice()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((name, samples))
+            })
+            .collect::<Result<BTreeMap<_, _>, prost::DecodeError>>()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let checker = self.checker.clone();
         self.runtime.future_into_py(py, async move {
             let mut checker = checker
@@ -629,6 +642,7 @@ impl WorkflowCheckRef {
                     &workflow_id,
                     initial,
                     &signals,
+                    &activity_results,
                     CheckLimits {
                         max_depth,
                         max_checks,

@@ -1,4 +1,4 @@
-"""Experimental, serverless exploration of timer and signal schedules."""
+"""Experimental, serverless exploration with generated signals and activity results."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
+import temporalio.activity
 import temporalio.api.common.v1
 import temporalio.api.failure.v1
 import temporalio.api.history.v1
@@ -24,6 +25,11 @@ import temporalio.worker
 import temporalio.worker.workflow_sandbox
 import temporalio.workflow
 
+if TYPE_CHECKING:
+    import hypothesis.strategies
+
+_Sample = TypeVar("_Sample")
+
 
 @dataclass(frozen=True)
 class WorkflowCheckSignal:
@@ -32,8 +38,19 @@ class WorkflowCheckSignal:
     signal: str | Callable
     """Signal name or decorated handler."""
 
-    args: Sequence[Any] = ()
-    """Concrete argument values, encoded once and reused on replay."""
+    args: hypothesis.strategies.SearchStrategy[tuple[Any, ...]]
+    """Hypothesis strategy for positional argument tuples, such as ``st.tuples(st.text())``."""
+
+
+@dataclass(frozen=True)
+class WorkflowCheckActivity:
+    """A remote activity whose successful results are generated, never executed."""
+
+    activity: str | Callable
+    """Activity type name or decorated function, used only to identify its type."""
+
+    result: hypothesis.strategies.SearchStrategy[Any]
+    """Hypothesis strategy for a single return value, including ``None``."""
 
 
 @dataclass(frozen=True)
@@ -55,10 +72,18 @@ class WorkflowChecker:
     """Experimental workflow checking without a Temporal server.
 
     Uses the normal Core and Python workflow runners, with a fresh replay for
-    each explored frontier. Supports timers, signals, and terminal commands.
-    Activities, updates, child workflows, and continue-as-new are unsupported.
+    each explored frontier. Supports timers, signals, successful remote activity
+    results, and terminal commands. Activity functions are never executed.
+    Activity failures, timeouts, retries, cancellation, local activities, updates,
+    child workflows, and continue-as-new are unsupported.
     Workflow failures are terminal outcomes; workflow-task failures and timeouts
     are counterexamples. Python execution uses the normal deadlock detector.
+
+    Input generation requires the ``temporalio[hypothesis]`` extra. Each strategy
+    is sampled before searching; Rust explores those concrete payloads without
+    drawing again during replay. This does not perform Hypothesis shrinking.
+    If strategies and workflows share a module, import Hypothesis inside
+    :py:meth:`temporalio.workflow.unsafe.imports_passed_through`.
     """
 
     def __init__(
@@ -88,6 +113,8 @@ class WorkflowChecker:
         *,
         args: Sequence[Any] = (),
         signals: Sequence[WorkflowCheckSignal] = (),
+        activities: Sequence[WorkflowCheckActivity] = (),
+        samples_per_strategy: int = 3,
         max_depth: int = 20,
         max_checks: int = 1_000,
         timeout: timedelta = timedelta(seconds=30),
@@ -99,7 +126,14 @@ class WorkflowChecker:
             workflow: Registered workflow name or decorated run method.
             arg: Single start argument, mutually exclusive with args.
             args: Multiple start arguments.
-            signals: Concrete signal inputs, each eligible repeatedly.
+            signals: Signal argument strategies, each eligible repeatedly.
+            activities: Return-value strategies keyed by remote activity type.
+                Every scheduled activity must have a configured strategy.
+                Results use activity serialization context without an activity
+                ID or task queue, since samples are shared across invocations.
+            samples_per_strategy: Maximum generated examples per strategy.
+                Finite strategies may produce fewer examples. Duplicate encoded
+                payloads are explored only once per signal or activity type.
             max_depth: Maximum extensions after the initial task, which has depth zero.
             max_checks: Maximum new task frontiers, including the initial task.
             timeout: Overall search budget, including replay and eviction,
@@ -114,6 +148,8 @@ class WorkflowChecker:
         """
         if max_depth < 0 or max_checks <= 0:
             raise ValueError("max_depth must be nonnegative and max_checks positive")
+        if samples_per_strategy <= 0:
+            raise ValueError("samples_per_strategy must be positive")
         timeout_millis = math.ceil(timeout.total_seconds() * 1_000)
         task_timeout_millis = math.ceil(task_timeout.total_seconds() * 1_000)
         if timeout < timedelta(milliseconds=1) or task_timeout < timedelta(
@@ -143,16 +179,54 @@ class WorkflowChecker:
         start.workflow_task_timeout.FromTimedelta(task_timeout)
         encoded_signals = []
         for signal in signals:
-            encoded_signals.append(
-                temporalio.api.history.v1.WorkflowExecutionSignaledEventAttributes(
-                    signal_name=temporalio.workflow._SignalDefinition.must_name_from_fn_or_str(
-                        signal.signal
-                    ),
-                    input=temporalio.api.common.v1.Payloads(
-                        payloads=await converter.encode(signal.args)
-                    ),
-                ).SerializeToString()
+            signal_name = (
+                temporalio.workflow._SignalDefinition.must_name_from_fn_or_str(
+                    signal.signal
+                )
             )
+            for signal_args in _sample(signal.args, samples_per_strategy):
+                if not isinstance(signal_args, tuple):
+                    raise TypeError("Signal argument strategies must generate tuples")
+                encoded = (
+                    temporalio.api.history.v1.WorkflowExecutionSignaledEventAttributes(
+                        signal_name=signal_name,
+                        input=temporalio.api.common.v1.Payloads(
+                            payloads=await converter.encode(signal_args)
+                        ),
+                    ).SerializeToString()
+                )
+                if encoded not in encoded_signals:
+                    encoded_signals.append(encoded)
+
+        encoded_activity_results: dict[str, list[bytes]] = {}
+        for activity in activities:
+            activity_name = (
+                activity.activity
+                if isinstance(activity.activity, str)
+                else temporalio.activity._Definition.must_from_callable(
+                    activity.activity
+                ).name
+            )
+            if not activity_name:
+                raise ValueError("Activity result strategies require a named activity")
+            activity_converter = self._data_converter.with_context(
+                temporalio.converter.ActivitySerializationContext(
+                    namespace=self._namespace,
+                    workflow_id=workflow_id,
+                    workflow_type=name,
+                    activity_type=activity_name,
+                    activity_id=None,
+                    activity_task_queue=None,
+                    is_local=False,
+                )
+            )
+            results = encoded_activity_results.setdefault(activity_name, [])
+            for value in _sample(activity.result, samples_per_strategy):
+                encoded = temporalio.api.common.v1.Payloads(
+                    payloads=await activity_converter.encode([value])
+                ).SerializeToString()
+                if encoded not in results:
+                    results.append(encoded)
 
         def on_eviction(
             _run_id: str,
@@ -171,6 +245,7 @@ class WorkflowChecker:
                     workflow_id,
                     start.SerializeToString(),
                     encoded_signals,
+                    encoded_activity_results,
                     max_depth,
                     max_checks,
                     timeout_millis,
@@ -202,3 +277,29 @@ class WorkflowChecker:
             bridge_worker.initiate_shutdown()
             await asyncio.gather(worker_task, return_exceptions=True)
             await bridge_worker.finalize_shutdown()
+
+
+def _sample(
+    strategy: hypothesis.strategies.SearchStrategy[_Sample], count: int
+) -> list[_Sample]:
+    try:
+        import hypothesis
+    except ImportError as err:
+        raise RuntimeError(
+            "Workflow input generation requires the temporalio[hypothesis] extra"
+        ) from err
+
+    values: list[_Sample] = []
+
+    @hypothesis.settings(
+        max_examples=count,
+        database=None,
+        deadline=None,
+        phases=(hypothesis.Phase.generate,),
+    )
+    @hypothesis.given(strategy)
+    def collect(value: _Sample) -> None:
+        values.append(value)
+
+    collect()
+    return values

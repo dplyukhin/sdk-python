@@ -1,5 +1,6 @@
 .venv
 __pycache__
+/.hypothesis/
 /build
 /dist
 temporalio/bridge/libtemporal_sdk_bridge.dylib.dSYM/

@@ -1,17 +1,28 @@
+from __future__ import annotations
+
 import asyncio
+import dataclasses
+from collections.abc import Callable, Sequence
 from datetime import timedelta
+from typing import Any
 
 import pytest
 
 import temporalio.activity
+import temporalio.api.common.v1
 import temporalio.bridge.proto.workflow_activation
 import temporalio.bridge.proto.workflow_completion
 import temporalio.bridge.worker
 import temporalio.client
+import temporalio.converter
 import temporalio.testing
+import temporalio.testing._workflow_check
 import temporalio.worker
 import temporalio.worker._workflow
 import temporalio.workflow
+
+with temporalio.workflow.unsafe.imports_passed_through():
+    import hypothesis.strategies as st
 
 
 @temporalio.workflow.defn
@@ -50,6 +61,23 @@ class RepeatedSignal:
 
 
 @temporalio.workflow.defn
+class SignalTupleWorkflow:
+    def __init__(self) -> None:
+        self.received = False
+        self.value = (0, "")
+
+    @temporalio.workflow.run
+    async def run(self) -> None:
+        await temporalio.workflow.wait_condition(lambda: self.received)
+        assert self.value != (7, "bad"), "generated signal tuple"
+
+    @temporalio.workflow.signal
+    def set_value(self, number: int, text: str) -> None:
+        self.value = (number, text)
+        self.received = True
+
+
+@temporalio.workflow.defn
 class ExpensiveTask:
     @temporalio.workflow.run
     async def run(self) -> int:
@@ -64,17 +92,51 @@ class InitialFailure:
 
 
 @temporalio.activity.defn
-async def forbidden_activity() -> None:
+async def forbidden_activity() -> int:
     raise AssertionError("Activity implementations must not execute")
+
+
+@temporalio.activity.defn
+async def forbidden_none_activity() -> None:
+    raise AssertionError("Activity implementations must not execute")
+
+
+@temporalio.workflow.defn
+class NoneActivityWorkflow:
+    @temporalio.workflow.run
+    async def run(self) -> None:
+        await temporalio.workflow.execute_activity(
+            forbidden_none_activity, start_to_close_timeout=timedelta(seconds=1)
+        )
+        raise RuntimeError("received generated None")
 
 
 @temporalio.workflow.defn
 class ActivityWorkflow:
     @temporalio.workflow.run
     async def run(self) -> None:
-        await temporalio.workflow.execute_activity(
+        value = await temporalio.workflow.execute_activity(
             forbidden_activity, start_to_close_timeout=timedelta(seconds=1)
         )
+        assert value != 1, "generated activity result"
+
+
+@temporalio.workflow.defn
+class ActivityOrderWorkflow:
+    @temporalio.workflow.run
+    async def run(self) -> None:
+        order: list[str] = []
+
+        async def resolve(activity_id: str) -> None:
+            await temporalio.workflow.execute_activity(
+                forbidden_activity,
+                activity_id=activity_id,
+                start_to_close_timeout=timedelta(seconds=1),
+            )
+            order.append(activity_id)
+
+        await asyncio.gather(resolve("first"), resolve("second"))
+        assert order != ["second", "first"], "activity completion order"
 
 
 async def test_check_workflow_backtracks_and_returns_reproducible_history(
@@ -82,7 +144,7 @@ async def test_check_workflow_backtracks_and_returns_reproducible_history(
 ) -> None:
     client = await temporalio.client.Client.connect("127.0.0.1:1", lazy=True)
     signal = temporalio.testing.WorkflowCheckSignal(
-        TimerSignalRace.set_value, args=["bad"]
+        TimerSignalRace.set_value, args=st.tuples(st.just("bad"))
     )
     # Initial task and timer-first branch succeed; the third frontier is its signal-first sibling.
     limited = await client.check_workflow(
@@ -138,7 +200,11 @@ async def test_check_workflow_allows_repeated_signals(
         workflows=[RepeatedSignal]
     ).check_workflow(
         RepeatedSignal.run,
-        signals=[temporalio.testing.WorkflowCheckSignal(RepeatedSignal.increment)],
+        signals=[
+            temporalio.testing.WorkflowCheckSignal(
+                RepeatedSignal.increment, args=st.tuples()
+            )
+        ],
         max_depth=max_depth,
     )
     assert (result.exception is not None) == finds_failure
@@ -152,13 +218,276 @@ async def test_check_workflow_allows_repeated_signals(
         )
 
 
-async def test_check_workflow_rejects_activities_without_running_them() -> None:
-    with pytest.raises(
-        RuntimeError, match="unsupported workflow command: ScheduleActivityTask"
-    ):
+async def test_check_workflow_requires_activity_results_without_running_them() -> None:
+    with pytest.raises(RuntimeError, match="no sampled results for activity type"):
         await temporalio.testing.WorkflowChecker(
             workflows=[ActivityWorkflow]
         ).check_workflow(ActivityWorkflow.run)
+
+
+async def test_check_workflow_samples_signal_arguments() -> None:
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[TimerSignalRace]
+    ).check_workflow(
+        TimerSignalRace.run,
+        "bad",
+        signals=[
+            temporalio.testing.WorkflowCheckSignal(
+                TimerSignalRace.set_value,
+                args=st.tuples(st.sampled_from(["good", "bad"])),
+            )
+        ],
+        samples_per_strategy=10,
+        max_depth=1,
+        max_checks=4,
+    )
+    assert result.exception is not None
+    assert "signal won the race" in str(result.exception)
+    assert result.history is not None
+    [signal] = [
+        e.workflow_execution_signaled_event_attributes
+        for e in result.history.events
+        if e.HasField("workflow_execution_signaled_event_attributes")
+    ]
+    assert await temporalio.converter.DataConverter.default.decode(
+        signal.input.payloads
+    ) == ["bad"]
+
+
+async def test_check_workflow_generates_signal_argument_tuples() -> None:
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[SignalTupleWorkflow]
+    ).check_workflow(
+        SignalTupleWorkflow.run,
+        signals=[
+            temporalio.testing.WorkflowCheckSignal(
+                SignalTupleWorkflow.set_value,
+                args=st.tuples(st.just(7), st.just("bad")),
+            )
+        ],
+    )
+    assert result.exception is not None
+    assert "generated signal tuple" in str(result.exception)
+
+
+@pytest.mark.parametrize("activity", [forbidden_activity, "forbidden_activity"])
+async def test_check_workflow_samples_activity_results_and_replays(
+    activity: str | Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = await temporalio.client.Client.connect("127.0.0.1:1", lazy=True)
+    result = await client.check_workflow(
+        ActivityWorkflow.run,
+        workflows=[ActivityWorkflow],
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                activity, result=st.integers(min_value=0, max_value=1)
+            )
+        ],
+        samples_per_strategy=10,
+        max_depth=1,
+        max_checks=3,
+    )
+    assert result.exception is not None
+    assert "generated activity result" in str(result.exception)
+    assert result.history is not None
+    scheduled = next(
+        e
+        for e in result.history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+    )
+    started = next(
+        e
+        for e in result.history.events
+        if e.HasField("activity_task_started_event_attributes")
+    )
+    completed = next(
+        e
+        for e in result.history.events
+        if e.HasField("activity_task_completed_event_attributes")
+    )
+    assert (
+        started.activity_task_started_event_attributes.scheduled_event_id
+        == scheduled.event_id
+    )
+    assert started.activity_task_started_event_attributes.attempt == 1
+    assert (
+        completed.activity_task_completed_event_attributes.scheduled_event_id
+        == scheduled.event_id
+    )
+    assert (
+        completed.activity_task_completed_event_attributes.started_event_id
+        == started.event_id
+    )
+    assert await temporalio.converter.DataConverter.default.decode(
+        completed.activity_task_completed_event_attributes.result.payloads
+    ) == [1]
+
+    def no_sampling(*_args: object) -> None:
+        raise AssertionError("Replay must use recorded payloads, not generator draws")
+
+    monkeypatch.setattr(temporalio.testing._workflow_check, "_sample", no_sampling)
+    failures: list[str] = []
+    original = temporalio.bridge.worker.Worker.complete_workflow_activation
+
+    async def record_completion(
+        self: temporalio.bridge.worker.Worker,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+    ) -> None:
+        if completion.HasField("failed"):
+            failures.append(completion.failed.failure.message)
+        await original(self, completion)
+
+    monkeypatch.setattr(
+        temporalio.bridge.worker.Worker,
+        "complete_workflow_activation",
+        record_completion,
+    )
+    await temporalio.worker.Replayer(workflows=[ActivityWorkflow]).replay_workflow(
+        result.history, raise_on_replay_failure=False
+    )
+    assert any("generated activity result" in failure for failure in failures)
+
+
+async def test_check_workflow_records_none_activity_result() -> None:
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[NoneActivityWorkflow]
+    ).check_workflow(
+        NoneActivityWorkflow.run,
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_none_activity, result=st.none()
+            )
+        ],
+    )
+    assert result.exception is not None
+    assert "received generated None" in str(result.exception)
+    assert result.history is not None
+    completed = next(
+        e.activity_task_completed_event_attributes
+        for e in result.history.events
+        if e.HasField("activity_task_completed_event_attributes")
+    )
+    assert await temporalio.converter.DataConverter.default.decode(
+        completed.result.payloads
+    ) == [None]
+
+
+class _CheckingCodec(
+    temporalio.converter.PayloadCodec, temporalio.converter.WithSerializationContext
+):
+    def __init__(
+        self,
+        contexts: list[temporalio.converter.SerializationContext],
+        context: temporalio.converter.SerializationContext | None = None,
+    ) -> None:
+        self.contexts = contexts
+        self.context = context
+
+    def with_context(
+        self, context: temporalio.converter.SerializationContext
+    ) -> _CheckingCodec:
+        return _CheckingCodec(self.contexts, context)
+
+    async def encode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        assert self.context is not None
+        self.contexts.append(self.context)
+        return [
+            temporalio.api.common.v1.Payload(
+                metadata={"encoding": b"checking-test"}, data=p.SerializeToString()
+            )
+            for p in payloads
+        ]
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        assert self.context is not None
+        return [temporalio.api.common.v1.Payload.FromString(p.data) for p in payloads]
+
+
+async def test_check_workflow_encodes_generated_activity_results_with_context() -> None:
+    contexts: list[temporalio.converter.SerializationContext] = []
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[ActivityWorkflow],
+        namespace="generated-namespace",
+        data_converter=dataclasses.replace(
+            temporalio.converter.DataConverter.default,
+            payload_codec=_CheckingCodec(contexts),
+        ),
+    ).check_workflow(
+        ActivityWorkflow.run,
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_activity, result=st.just(1)
+            )
+        ],
+    )
+    assert result.exception is not None
+    assert "generated activity result" in str(result.exception)
+    assert result.history is not None
+    assert any(
+        isinstance(context, temporalio.converter.ActivitySerializationContext)
+        and context.namespace == "generated-namespace"
+        and context.workflow_id == result.history.workflow_id
+        and context.workflow_type == "ActivityWorkflow"
+        and context.activity_type == "forbidden_activity"
+        and not context.is_local
+        for context in contexts
+    )
+
+
+async def test_check_workflow_backtracks_activity_completion_order() -> None:
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[ActivityOrderWorkflow]
+    ).check_workflow(
+        ActivityOrderWorkflow.run,
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_activity, result=st.just(0)
+            )
+        ],
+        max_depth=2,
+        max_checks=5,
+    )
+    assert result.exception is not None
+    assert "activity completion order" in str(result.exception)
+    assert result.history is not None
+    schedules = {
+        e.event_id: e.activity_task_scheduled_event_attributes.activity_id
+        for e in result.history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+    }
+    order = [
+        schedules[e.activity_task_completed_event_attributes.scheduled_event_id]
+        for e in result.history.events
+        if e.HasField("activity_task_completed_event_attributes")
+    ]
+    assert order == ["second", "first"]
+
+
+async def test_check_workflow_rejects_non_tuple_signal_arguments() -> None:
+    with pytest.raises(TypeError, match="must generate tuples"):
+        await temporalio.testing.WorkflowChecker(
+            workflows=[RepeatedSignal]
+        ).check_workflow(
+            RepeatedSignal.run,
+            signals=[
+                temporalio.testing.WorkflowCheckSignal(
+                    RepeatedSignal.increment,
+                    args=st.just([]),  # type: ignore[arg-type]
+                )
+            ],
+        )
+
+
+async def test_check_workflow_requires_positive_sample_count() -> None:
+    with pytest.raises(ValueError, match="samples_per_strategy must be positive"):
+        await temporalio.testing.WorkflowChecker(
+            workflows=[RepeatedSignal]
+        ).check_workflow(RepeatedSignal.run, samples_per_strategy=0)
 
 
 async def test_check_workflow_task_timeout_is_a_counterexample() -> None:

@@ -408,12 +408,14 @@ class Client:
         args: Sequence[Any] = (),
         workflows: Sequence[type],
         signals: Sequence[temporalio.testing.WorkflowCheckSignal] = (),
+        activities: Sequence[temporalio.testing.WorkflowCheckActivity] = (),
+        samples_per_strategy: int = 3,
         max_depth: int = 20,
         max_checks: int = 1_000,
         timeout: timedelta = timedelta(seconds=30),
         task_timeout: timedelta = timedelta(seconds=10),
     ) -> temporalio.testing.WorkflowCheckResult:
-        """Experimentally check timer/signal schedules without using the connected server.
+        """Experimentally check generated schedules without using the connected server.
 
         See :py:meth:`temporalio.testing.WorkflowChecker.check_workflow` for bounds
         and result semantics. Registered workflow implementations must be supplied
@@ -430,6 +432,8 @@ class Client:
             arg,
             args=args,
             signals=signals,
+            activities=activities,
+            samples_per_strategy=samples_per_strategy,
             max_depth=max_depth,
             max_checks=max_checks,
             timeout=timeout,
