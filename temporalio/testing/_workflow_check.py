@@ -57,6 +57,8 @@ class WorkflowCheckActivity:
 
     Failures must be non-retryable or the activity must use a retry policy with
     ``maximum_attempts=1``. At least one of ``result`` or ``failure`` is required.
+    Cancellation acknowledgments are generated from cancellation commands,
+    not from this strategy.
     """
 
 
@@ -81,12 +83,14 @@ class WorkflowChecker:
     Uses the normal Core and Python workflow runners, with a fresh replay for
     each explored frontier. Supports timers, signals, remote activity successes,
     terminal application failures and start-to-close timeouts, search attribute
-    and memo updates, patch markers, and terminal commands. Activity functions
-    are never executed.
-    Other activity timeouts, retries, cancellation, local activities, updates,
-    child workflows, and continue-as-new are unsupported.
-    Workflow failures are terminal outcomes; workflow-task failures and timeouts
-    are counterexamples. Python execution uses the normal deadlock detector.
+    and memo updates, patch markers, activity and workflow cancellation, and
+    terminal commands. Activity functions are never executed. Activity cancellation
+    acknowledgments are explored only after a workflow requests cancellation;
+    completion and failure remain eligible until acknowledgment.
+    Other activity timeouts, retries, local activities, updates, child workflows,
+    and continue-as-new are unsupported. Workflow failures and cancellations
+    are terminal outcomes; workflow-task failures and timeouts are counterexamples.
+    Python execution uses the normal deadlock detector.
 
     Input generation requires the ``temporalio[hypothesis]`` extra. Each strategy
     is sampled before searching; Rust explores those concrete payloads without
@@ -123,6 +127,7 @@ class WorkflowChecker:
         args: Sequence[Any] = (),
         signals: Sequence[WorkflowCheckSignal] = (),
         activities: Sequence[WorkflowCheckActivity] = (),
+        workflow_cancellation: bool = False,
         samples_per_strategy: int = 3,
         max_depth: int = 20,
         max_checks: int = 1_000,
@@ -140,6 +145,9 @@ class WorkflowChecker:
                 Every scheduled activity must have a configured strategy.
                 Outcomes use activity serialization context without an activity
                 ID or task queue, since samples are shared across invocations.
+            workflow_cancellation: Whether to explore an external workflow
+                cancellation request at each open frontier. Each branch receives
+                at most one request, which the workflow may catch or suppress.
             samples_per_strategy: Maximum generated examples per strategy.
                 Finite strategies may produce fewer examples. Duplicate encoded
                 payloads are explored only once per signal or activity type.
@@ -272,6 +280,7 @@ class WorkflowChecker:
                     encoded_signals,
                     encoded_activity_results,
                     encoded_activity_failures,
+                    workflow_cancellation,
                     max_depth,
                     max_checks,
                     timeout_millis,

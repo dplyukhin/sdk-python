@@ -1,0 +1,1 @@
+Core: Serverless workflow checking explores activity cancellation acknowledgments alongside competing completions and failures, and can optionally explore external workflow cancellation requests. Cancellation histories retain the events needed to replay cancellation handling, including workflows that suppress cancellation.

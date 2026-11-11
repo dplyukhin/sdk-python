@@ -20,7 +20,7 @@ use temporalio_common::protos::temporal::api::history::v1::{
 };
 use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDriverInfo};
 use temporalio_sdk_core::replay::{
-    checking::{init_checking_worker, CheckLimits, WorkflowCheck},
+    checking::{init_checking_worker, CheckInputs, CheckLimits, WorkflowCheck},
     model::{ActivitySamples, ModelHistory},
 };
 use temporalio_sdk_core::replay::{HistoryForReplay, ReplayWorkerInput};
@@ -606,6 +606,7 @@ impl WorkflowCheckRef {
         signals: Vec<Vec<u8>>,
         activity_results: BTreeMap<String, Vec<Vec<u8>>>,
         activity_failures: BTreeMap<String, Vec<Vec<u8>>>,
+        workflow_cancellation: bool,
         max_depth: usize,
         max_checks: usize,
         timeout_millis: u64,
@@ -656,8 +657,11 @@ impl WorkflowCheckRef {
                 .run(
                     &workflow_id,
                     initial,
-                    &signals,
-                    &activity_samples,
+                    &CheckInputs {
+                        signals,
+                        activity_samples,
+                        workflow_cancellation,
+                    },
                     CheckLimits {
                         max_depth,
                         max_checks,
