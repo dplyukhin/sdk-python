@@ -14,13 +14,14 @@ use temporalio_common::protos::coresdk::{
     nexus::NexusTaskCompletion, ActivityHeartbeat, ActivityTaskCompletion,
 };
 use temporalio_common::protos::temporal::api::common::v1::Payloads;
+use temporalio_common::protos::temporal::api::failure::v1::Failure;
 use temporalio_common::protos::temporal::api::history::v1::{
     History, WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
 };
 use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDriverInfo};
 use temporalio_sdk_core::replay::{
     checking::{init_checking_worker, CheckLimits, WorkflowCheck},
-    model::ModelHistory,
+    model::{ActivitySamples, ModelHistory},
 };
 use temporalio_sdk_core::replay::{HistoryForReplay, ReplayWorkerInput};
 use temporalio_sdk_core::{
@@ -604,6 +605,7 @@ impl WorkflowCheckRef {
         start: &[u8],
         signals: Vec<Vec<u8>>,
         activity_results: BTreeMap<String, Vec<Vec<u8>>>,
+        activity_failures: BTreeMap<String, Vec<Vec<u8>>>,
         max_depth: usize,
         max_checks: usize,
         timeout_millis: u64,
@@ -619,17 +621,30 @@ impl WorkflowCheckRef {
             .map(|s| WorkflowExecutionSignaledEventAttributes::decode(s.as_slice()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let activity_results = activity_results
+        let mut activity_samples = activity_results
             .into_iter()
             .map(|(name, samples)| {
                 let samples = samples
                     .iter()
                     .map(|s| Payloads::decode(s.as_slice()))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok((name, samples))
+                Ok((
+                    name,
+                    ActivitySamples {
+                        results: samples,
+                        ..Default::default()
+                    },
+                ))
             })
             .collect::<Result<BTreeMap<_, _>, prost::DecodeError>>()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        for (name, samples) in activity_failures {
+            activity_samples.entry(name).or_default().failures = samples
+                .iter()
+                .map(|s| Failure::decode(s.as_slice()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
         let checker = self.checker.clone();
         self.runtime.future_into_py(py, async move {
             let mut checker = checker
@@ -642,7 +657,7 @@ impl WorkflowCheckRef {
                     &workflow_id,
                     initial,
                     &signals,
-                    &activity_results,
+                    &activity_samples,
                     CheckLimits {
                         max_depth,
                         max_checks,

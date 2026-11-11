@@ -1,4 +1,4 @@
-"""Experimental, serverless exploration with generated signals and activity results."""
+"""Experimental, serverless exploration with generated signals and activity outcomes."""
 
 from __future__ import annotations
 
@@ -44,13 +44,20 @@ class WorkflowCheckSignal:
 
 @dataclass(frozen=True)
 class WorkflowCheckActivity:
-    """A remote activity whose successful results are generated, never executed."""
+    """A remote activity with generated outcomes, whose implementation never executes."""
 
     activity: str | Callable
     """Activity type name or decorated function, used only to identify its type."""
 
-    result: hypothesis.strategies.SearchStrategy[Any]
+    result: hypothesis.strategies.SearchStrategy[Any] | None = None
     """Hypothesis strategy for a single return value, including ``None``."""
+
+    failure: hypothesis.strategies.SearchStrategy[Exception] | None = None
+    """Strategy for application exceptions or start-to-close ``TimeoutError`` values.
+
+    Failures must be non-retryable or the activity must use a retry policy with
+    ``maximum_attempts=1``. At least one of ``result`` or ``failure`` is required.
+    """
 
 
 @dataclass(frozen=True)
@@ -72,10 +79,11 @@ class WorkflowChecker:
     """Experimental workflow checking without a Temporal server.
 
     Uses the normal Core and Python workflow runners, with a fresh replay for
-    each explored frontier. Supports timers, signals, successful remote activity
-    results, search attribute and memo updates, patch markers, and terminal
-    commands. Activity functions are never executed.
-    Activity failures, timeouts, retries, cancellation, local activities, updates,
+    each explored frontier. Supports timers, signals, remote activity successes,
+    terminal application failures and start-to-close timeouts, search attribute
+    and memo updates, patch markers, and terminal commands. Activity functions
+    are never executed.
+    Other activity timeouts, retries, cancellation, local activities, updates,
     child workflows, and continue-as-new are unsupported.
     Workflow failures are terminal outcomes; workflow-task failures and timeouts
     are counterexamples. Python execution uses the normal deadlock detector.
@@ -128,9 +136,9 @@ class WorkflowChecker:
             arg: Single start argument, mutually exclusive with args.
             args: Multiple start arguments.
             signals: Signal argument strategies, each eligible repeatedly.
-            activities: Return-value strategies keyed by remote activity type.
+            activities: Outcome strategies keyed by remote activity type.
                 Every scheduled activity must have a configured strategy.
-                Results use activity serialization context without an activity
+                Outcomes use activity serialization context without an activity
                 ID or task queue, since samples are shared across invocations.
             samples_per_strategy: Maximum generated examples per strategy.
                 Finite strategies may produce fewer examples. Duplicate encoded
@@ -200,7 +208,10 @@ class WorkflowChecker:
                     encoded_signals.append(encoded)
 
         encoded_activity_results: dict[str, list[bytes]] = {}
+        encoded_activity_failures: dict[str, list[bytes]] = {}
         for activity in activities:
+            if activity.result is None and activity.failure is None:
+                raise ValueError("Activity strategies require a result or failure")
             activity_name = (
                 activity.activity
                 if isinstance(activity.activity, str)
@@ -222,12 +233,25 @@ class WorkflowChecker:
                 )
             )
             results = encoded_activity_results.setdefault(activity_name, [])
-            for value in _sample(activity.result, samples_per_strategy):
-                encoded = temporalio.api.common.v1.Payloads(
-                    payloads=await activity_converter.encode([value])
-                ).SerializeToString()
-                if encoded not in results:
-                    results.append(encoded)
+            if activity.result is not None:
+                for value in _sample(activity.result, samples_per_strategy):
+                    encoded = temporalio.api.common.v1.Payloads(
+                        payloads=await activity_converter.encode([value])
+                    ).SerializeToString()
+                    if encoded not in results:
+                        results.append(encoded)
+            failures = encoded_activity_failures.setdefault(activity_name, [])
+            if activity.failure is not None:
+                for error in _sample(activity.failure, samples_per_strategy):
+                    if not isinstance(error, Exception):
+                        raise TypeError(
+                            "Activity failure strategies must generate exceptions"
+                        )
+                    failure = temporalio.api.failure.v1.Failure()
+                    await activity_converter.encode_failure(error, failure)
+                    encoded = failure.SerializeToString()
+                    if encoded not in failures:
+                        failures.append(encoded)
 
         def on_eviction(
             _run_id: str,
@@ -247,6 +271,7 @@ class WorkflowChecker:
                     start.SerializeToString(),
                     encoded_signals,
                     encoded_activity_results,
+                    encoded_activity_failures,
                     max_depth,
                     max_checks,
                     timeout_millis,

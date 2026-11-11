@@ -17,6 +17,7 @@ import temporalio.bridge.worker
 import temporalio.client
 import temporalio.common
 import temporalio.converter
+import temporalio.exceptions
 import temporalio.testing
 import temporalio.testing._workflow_check
 import temporalio.worker
@@ -185,6 +186,258 @@ class OrderApprovalWorkflow:
     def revoke(self) -> None:
         self.revoked = True
         self.set_stage("revoked")
+
+
+@temporalio.workflow.defn
+class CompensationRaceWorkflow:
+    def __init__(self) -> None:
+        self.reserved: bool = False
+        self.payment_failed: bool = False
+
+    @temporalio.workflow.run
+    async def run(self) -> None:
+        assert temporalio.workflow.patched("compensate-payment")
+
+        async def reserve() -> None:
+            await temporalio.workflow.execute_activity(
+                forbidden_none_activity,
+                activity_id="reserve",
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            self.reserved = True
+
+        async def pay() -> None:
+            try:
+                await temporalio.workflow.execute_activity(
+                    forbidden_activity,
+                    activity_id="pay",
+                    start_to_close_timeout=timedelta(seconds=10),
+                    retry_policy=temporalio.common.RetryPolicy(maximum_attempts=1),
+                )
+            except temporalio.exceptions.ActivityError as error:
+                cause = error.cause
+                if isinstance(cause, temporalio.exceptions.ApplicationError):
+                    assert cause.type == "PaymentDeclined"
+                    assert cause.details == ("payment-123",)
+                else:
+                    assert isinstance(cause, temporalio.exceptions.TimeoutError)
+                    assert (
+                        cause.type == temporalio.exceptions.TimeoutType.START_TO_CLOSE
+                    )
+                self.payment_failed = True
+                self.reserved = False
+                temporalio.workflow.upsert_memo({"payment": "failed"})
+
+        await asyncio.gather(reserve(), pay())
+        assert not (self.payment_failed and self.reserved), (
+            "late reservation escaped compensation"
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        temporalio.exceptions.ApplicationError(
+            "declined", "payment-123", type="PaymentDeclined"
+        ),
+        temporalio.exceptions.TimeoutError(
+            "payment timed out",
+            type=temporalio.exceptions.TimeoutType.START_TO_CLOSE,
+            last_heartbeat_details=[],
+        ),
+    ],
+    ids=["application", "start-to-close"],
+)
+async def test_check_workflow_finds_activity_compensation_race(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contexts: list[temporalio.converter.SerializationContext] = []
+    converter = dataclasses.replace(
+        temporalio.converter.DataConverter.default,
+        payload_codec=_CheckingCodec(contexts),
+        failure_converter_class=temporalio.converter.DefaultFailureConverterWithEncodedAttributes,
+    )
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[CompensationRaceWorkflow], data_converter=converter
+    ).check_workflow(
+        CompensationRaceWorkflow.run,
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_none_activity, result=st.none()
+            ),
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_activity, result=st.just(1), failure=st.just(error)
+            ),
+        ],
+        max_depth=2,
+        max_checks=20,
+    )
+    assert result.exception is not None
+    assert "late reservation escaped compensation" in str(result.exception)
+    assert result.history is not None
+    failed = next(
+        e
+        for e in result.history.events
+        if e.HasField("activity_task_failed_event_attributes")
+        or e.HasField("activity_task_timed_out_event_attributes")
+    )
+    attributes = (
+        failed.activity_task_timed_out_event_attributes
+        if isinstance(error, temporalio.exceptions.TimeoutError)
+        else failed.activity_task_failed_event_attributes
+    )
+    assert (
+        attributes.retry_state
+        == temporalio.exceptions.RetryState.MAXIMUM_ATTEMPTS_REACHED
+    )
+    scheduled = result.history.events[attributes.scheduled_event_id - 1]
+    started = result.history.events[attributes.started_event_id - 1]
+    assert scheduled.activity_task_scheduled_event_attributes.activity_id == "pay"
+    assert (
+        started.activity_task_started_event_attributes.scheduled_event_id
+        == scheduled.event_id
+    )
+    assert (
+        attributes.failure.encoded_attributes.metadata["encoding"] == b"checking-test"
+    )
+    if isinstance(error, temporalio.exceptions.TimeoutError):
+        assert (
+            failed.event_time.ToDatetime() - started.event_time.ToDatetime()
+        ) == timedelta(seconds=10)
+    completed = next(
+        e
+        for e in result.history.events
+        if e.HasField("activity_task_completed_event_attributes")
+    )
+    assert failed.event_id < completed.event_id
+    assert any(
+        isinstance(context, temporalio.converter.ActivitySerializationContext)
+        and context.activity_type == "forbidden_activity"
+        and context.activity_id is None
+        for context in contexts
+    )
+
+    failures: list[str] = []
+    original = temporalio.bridge.worker.Worker.complete_workflow_activation
+
+    async def record_completion(
+        self: temporalio.bridge.worker.Worker,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+    ) -> None:
+        if completion.HasField("failed"):
+            decoded = await converter.with_context(
+                temporalio.converter.WorkflowSerializationContext(
+                    namespace="WorkflowCheckNamespace",
+                    workflow_id=history.workflow_id,
+                )
+            ).decode_failure(completion.failed.failure)
+            failures.append(str(decoded))
+        await original(self, completion)
+
+    def no_sampling(*_args: object) -> None:
+        raise AssertionError("Replay must not generate new activity outcomes")
+
+    monkeypatch.setattr(temporalio.testing._workflow_check, "_sample", no_sampling)
+    monkeypatch.setattr(
+        temporalio.bridge.worker.Worker,
+        "complete_workflow_activation",
+        record_completion,
+    )
+    history = temporalio.client.WorkflowHistory.from_json(
+        result.history.workflow_id, result.history.to_json()
+    )
+    replay = await temporalio.worker.Replayer(
+        workflows=[CompensationRaceWorkflow],
+        namespace="WorkflowCheckNamespace",
+        data_converter=converter,
+    ).replay_workflow(history, raise_on_replay_failure=False)
+    assert replay.replay_failure is None
+    assert any(
+        "late reservation escaped compensation" in failure for failure in failures
+    )
+
+
+async def test_check_workflow_activity_failures_require_terminal_outcomes() -> None:
+    checker = temporalio.testing.WorkflowChecker(workflows=[ActivityWorkflow])
+    with pytest.raises(RuntimeError, match="maximum_attempts = 1"):
+        await checker.check_workflow(
+            ActivityWorkflow.run,
+            activities=[
+                temporalio.testing.WorkflowCheckActivity(
+                    forbidden_activity, failure=st.just(RuntimeError("retryable"))
+                )
+            ],
+        )
+    result = await checker.check_workflow(
+        ActivityWorkflow.run,
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_activity,
+                failure=st.just(
+                    temporalio.exceptions.ApplicationError(
+                        "terminal", non_retryable=True
+                    )
+                ),
+            )
+        ],
+    )
+    assert result.history is None
+    assert result.exception is None
+
+
+async def test_check_workflow_requires_an_activity_outcome_strategy() -> None:
+    with pytest.raises(ValueError, match="result or failure"):
+        await temporalio.testing.WorkflowChecker(
+            workflows=[ActivityWorkflow]
+        ).check_workflow(
+            ActivityWorkflow.run,
+            activities=[temporalio.testing.WorkflowCheckActivity(forbidden_activity)],
+        )
+
+
+async def test_check_workflow_failure_strategies_require_exceptions() -> None:
+    with pytest.raises(TypeError, match="must generate exceptions"):
+        await temporalio.testing.WorkflowChecker(
+            workflows=[ActivityWorkflow]
+        ).check_workflow(
+            ActivityWorkflow.run,
+            activities=[
+                temporalio.testing.WorkflowCheckActivity(
+                    forbidden_activity,
+                    failure=st.just("not an exception"),  # type: ignore[arg-type]
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        temporalio.exceptions.CancelledError("cancelled"),
+        temporalio.exceptions.TimeoutError(
+            "heartbeat timeout",
+            type=temporalio.exceptions.TimeoutType.HEARTBEAT,
+            last_heartbeat_details=[],
+        ),
+    ],
+    ids=["cancellation", "heartbeat"],
+)
+async def test_check_workflow_rejects_unsupported_activity_failures(
+    failure: Exception,
+) -> None:
+    with pytest.raises(
+        RuntimeError, match="only application failures and start-to-close"
+    ):
+        await temporalio.testing.WorkflowChecker(
+            workflows=[ActivityWorkflow]
+        ).check_workflow(
+            ActivityWorkflow.run,
+            activities=[
+                temporalio.testing.WorkflowCheckActivity(
+                    forbidden_activity, failure=st.just(failure)
+                )
+            ],
+        )
 
 
 @pytest.mark.parametrize("max_depth, finds_failure", [(2, False), (3, True)])
@@ -362,7 +615,9 @@ async def test_check_workflow_allows_repeated_signals(
 
 
 async def test_check_workflow_requires_activity_results_without_running_them() -> None:
-    with pytest.raises(RuntimeError, match="no sampled results for activity type"):
+    with pytest.raises(
+        RuntimeError, match="no sampled results or failures for activity type"
+    ):
         await temporalio.testing.WorkflowChecker(
             workflows=[ActivityWorkflow]
         ).check_workflow(ActivityWorkflow.run)

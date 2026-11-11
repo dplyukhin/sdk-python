@@ -1,0 +1,1 @@
+Core: Serverless workflow checking can explore sampled terminal activity application failures and start-to-close timeouts, preserving failure details for replay. Retryable outcomes require an activity retry policy limited to one attempt; retries and other timeout types remain unsupported.
