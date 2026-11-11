@@ -110,6 +110,8 @@ from ._workflow import (
 )
 
 if TYPE_CHECKING:
+    import temporalio.testing
+
     from ._interceptor import Interceptor
     from ._plugin import Plugin
 
@@ -397,6 +399,42 @@ class Client:
         # Update config and perform update
         self.service_client.config.api_key = value
         self.service_client.update_api_key(value)
+
+    async def check_workflow(
+        self,
+        workflow: str | Callable[..., Awaitable[Any]],
+        arg: Any = temporalio.common._arg_unset,
+        *,
+        args: Sequence[Any] = (),
+        workflows: Sequence[type],
+        signals: Sequence[temporalio.testing.WorkflowCheckSignal] = (),
+        max_depth: int = 20,
+        max_checks: int = 1_000,
+        timeout: timedelta = timedelta(seconds=30),
+        task_timeout: timedelta = timedelta(seconds=10),
+    ) -> temporalio.testing.WorkflowCheckResult:
+        """Experimentally check timer/signal schedules without using the connected server.
+
+        See :py:meth:`temporalio.testing.WorkflowChecker.check_workflow` for bounds
+        and result semantics. Registered workflow implementations must be supplied
+        locally. The client contributes only its namespace and data converter.
+        """
+        import temporalio.testing
+
+        return await temporalio.testing.WorkflowChecker(
+            workflows=workflows,
+            namespace=self.namespace,
+            data_converter=self.data_converter,
+        ).check_workflow(
+            workflow,
+            arg,
+            args=args,
+            signals=signals,
+            max_depth=max_depth,
+            max_checks=max_checks,
+            timeout=timeout,
+            task_timeout=task_timeout,
+        )
 
     # Overload for no-param workflow
     @overload

@@ -1,0 +1,1 @@
+Core: Added experimental serverless workflow checking through `Client.check_workflow` and `temporalio.testing.WorkflowChecker`, exploring bounded timer and signal schedules and returning the first workflow-task failure or timeout with its input history.

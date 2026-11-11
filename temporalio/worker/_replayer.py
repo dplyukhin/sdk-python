@@ -8,11 +8,13 @@ import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from typing import Callable, TypeVar
 
 from typing_extensions import TypedDict
 
 import temporalio.api.history.v1
 import temporalio.bridge.proto.workflow_activation
+import temporalio.bridge.runtime
 import temporalio.bridge.worker
 import temporalio.client
 import temporalio.converter
@@ -33,6 +35,7 @@ from ._workflow_instance import (
 from .workflow_sandbox import SandboxedWorkflowRunner
 
 logger = logging.getLogger(__name__)
+_Controller = TypeVar("_Controller")
 
 
 class Replayer:
@@ -242,121 +245,8 @@ class Replayer:
                 last_replay_complete.set()
 
             # Create worker referencing bridge worker
-            bridge_worker: temporalio.bridge.worker.Worker
-            task_queue = f"replay-{self._config.get('build_id')}"
-            runtime = (
-                self._config.get("runtime") or temporalio.runtime.Runtime.default()
-            )
-            data_converter = (
-                self._config.get("data_converter")
-                or temporalio.converter.DataConverter.default
-            )
-            workflow_worker = _WorkflowWorker(
-                bridge_worker=lambda: bridge_worker,
-                namespace=self._config.get("namespace", "ReplayNamespace"),
-                task_queue=task_queue,
-                workflows=self._config.get("workflows", []),
-                workflow_task_executor=self._config.get("workflow_task_executor"),
-                max_concurrent_workflow_tasks=5,
-                workflow_runner=self._config.get("workflow_runner")
-                or SandboxedWorkflowRunner(),
-                unsandboxed_workflow_runner=self._config.get(
-                    "unsandboxed_workflow_runner"
-                )
-                or UnsandboxedWorkflowRunner(),
-                data_converter=data_converter,
-                interceptors=self._config.get("interceptors", []),
-                workflow_failure_exception_types=self._config.get(
-                    "workflow_failure_exception_types", []
-                ),
-                patch_activation_callback=None,
-                debug_mode=self._config.get("debug_mode", False),
-                metric_meter=runtime.metric_meter,
-                on_eviction_hook=on_eviction_hook,
-                disable_eager_activity_execution=False,
-                disable_safe_eviction=self._config.get(
-                    "disable_safe_workflow_eviction", False
-                ),
-                should_enforce_versioning_behavior=False,
-                assert_local_activity_valid=lambda a: None,
-                encode_headers=self._config.get(
-                    "header_codec_behavior", HeaderCodecBehavior.NO_CODEC
-                )
-                != HeaderCodecBehavior.NO_CODEC,
-                max_workflow_task_external_storage_concurrency=1,
-                default_workflow_logic_flags=frozenset(
-                    self._default_workflow_logic_flags
-                ),
-            )
-            external_storage = data_converter.external_storage
-            storage_driver_types = (
-                {driver.type() for driver in external_storage.drivers}
-                if external_storage
-                else set()
-            )
-
-            # Create bridge worker
-            bridge_worker, pusher = temporalio.bridge.worker.Worker.for_replay(
-                runtime._core_runtime,
-                temporalio.bridge.worker.WorkerConfig(
-                    namespace=self._config.get("namespace", "ReplayNamespace"),
-                    task_queue=task_queue,
-                    identity_override=self._config.get("identity"),
-                    # Need to tell core whether we want to consider all
-                    # non-determinism exceptions as workflow fail, and whether we do
-                    # per workflow type
-                    nondeterminism_as_workflow_fail=workflow_worker.nondeterminism_as_workflow_fail(),
-                    nondeterminism_as_workflow_fail_for_types=workflow_worker.nondeterminism_as_workflow_fail_for_types(),
-                    # All values below are ignored but required by Core
-                    max_cached_workflows=2,
-                    tuner=temporalio.bridge.worker.TunerHolder(
-                        workflow_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
-                            2
-                        ),
-                        activity_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
-                            1
-                        ),
-                        local_activity_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
-                            1
-                        ),
-                        nexus_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
-                            1
-                        ),
-                    ),
-                    nonsticky_to_sticky_poll_ratio=1,
-                    no_remote_activities=True,
-                    disable_payload_error_limit=True,
-                    task_types=temporalio.bridge.worker.WorkerTaskTypes(
-                        enable_workflows=True,
-                        enable_local_activities=False,
-                        enable_remote_activities=False,
-                        enable_nexus=False,
-                    ),
-                    sticky_queue_schedule_to_start_timeout_millis=1000,
-                    max_heartbeat_throttle_interval_millis=1000,
-                    default_heartbeat_throttle_interval_millis=1000,
-                    max_activities_per_second=None,
-                    max_task_queue_activities_per_second=None,
-                    max_eager_activity_reservations_per_workflow_task=3,
-                    graceful_shutdown_period_millis=0,
-                    versioning_strategy=temporalio.bridge.worker.WorkerVersioningStrategyNone(
-                        build_id_no_versioning=self._config.get("build_id")
-                        or load_default_build_id(),
-                    ),
-                    workflow_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
-                        2
-                    ),
-                    activity_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
-                        1
-                    ),
-                    nexus_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
-                        1
-                    ),
-                    plugins=[
-                        (plugin.name(), plugin.version()) for plugin in self.plugins
-                    ],
-                    storage_drivers=storage_driver_types,
-                ),
+            workflow_worker, bridge_worker, pusher = self._create_workers(
+                on_eviction_hook, temporalio.bridge.worker.Worker.for_replay
             )
             bridge_worker_scope = bridge_worker
 
@@ -416,6 +306,126 @@ class Replayer:
                         await bridge_worker_scope.finalize_shutdown()
                 except Exception:
                     logger.warning("Failed to finalize shutdown", exc_info=True)
+
+    def _create_workers(
+        self,
+        on_eviction_hook: Callable[
+            [str, temporalio.bridge.proto.workflow_activation.RemoveFromCache], None
+        ],
+        factory: Callable[
+            [temporalio.bridge.runtime.Runtime, temporalio.bridge.worker.WorkerConfig],
+            tuple[temporalio.bridge.worker.Worker, _Controller],
+        ],
+    ) -> tuple[_WorkflowWorker, temporalio.bridge.worker.Worker, _Controller]:
+        """Share runner and converter configuration between replay and checking."""
+        bridge_worker: temporalio.bridge.worker.Worker
+        task_queue = f"replay-{self._config.get('build_id')}"
+        runtime = self._config.get("runtime") or temporalio.runtime.Runtime.default()
+        data_converter = (
+            self._config.get("data_converter")
+            or temporalio.converter.DataConverter.default
+        )
+        workflow_worker = _WorkflowWorker(
+            bridge_worker=lambda: bridge_worker,
+            namespace=self._config.get("namespace", "ReplayNamespace"),
+            task_queue=task_queue,
+            workflows=self._config.get("workflows", []),
+            workflow_task_executor=self._config.get("workflow_task_executor"),
+            max_concurrent_workflow_tasks=5,
+            workflow_runner=self._config.get("workflow_runner")
+            or SandboxedWorkflowRunner(),
+            unsandboxed_workflow_runner=self._config.get("unsandboxed_workflow_runner")
+            or UnsandboxedWorkflowRunner(),
+            data_converter=data_converter,
+            interceptors=self._config.get("interceptors", []),
+            workflow_failure_exception_types=self._config.get(
+                "workflow_failure_exception_types", []
+            ),
+            patch_activation_callback=None,
+            debug_mode=self._config.get("debug_mode", False),
+            metric_meter=runtime.metric_meter,
+            on_eviction_hook=on_eviction_hook,
+            disable_eager_activity_execution=False,
+            disable_safe_eviction=self._config.get(
+                "disable_safe_workflow_eviction", False
+            ),
+            should_enforce_versioning_behavior=False,
+            assert_local_activity_valid=lambda a: None,
+            encode_headers=self._config.get(
+                "header_codec_behavior", HeaderCodecBehavior.NO_CODEC
+            )
+            != HeaderCodecBehavior.NO_CODEC,
+            max_workflow_task_external_storage_concurrency=1,
+            default_workflow_logic_flags=frozenset(self._default_workflow_logic_flags),
+        )
+        external_storage = data_converter.external_storage
+        storage_driver_types = (
+            {driver.type() for driver in external_storage.drivers}
+            if external_storage
+            else set()
+        )
+        # Create bridge worker
+        bridge_worker, controller = factory(
+            runtime._core_runtime,
+            temporalio.bridge.worker.WorkerConfig(
+                namespace=self._config.get("namespace", "ReplayNamespace"),
+                task_queue=task_queue,
+                identity_override=self._config.get("identity"),
+                # Need to tell core whether we want to consider all
+                # non-determinism exceptions as workflow fail, and whether we do
+                # per workflow type
+                nondeterminism_as_workflow_fail=workflow_worker.nondeterminism_as_workflow_fail(),
+                nondeterminism_as_workflow_fail_for_types=workflow_worker.nondeterminism_as_workflow_fail_for_types(),
+                # All values below are ignored but required by Core
+                max_cached_workflows=2,
+                tuner=temporalio.bridge.worker.TunerHolder(
+                    workflow_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
+                        2
+                    ),
+                    activity_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
+                        1
+                    ),
+                    local_activity_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
+                        1
+                    ),
+                    nexus_slot_supplier=temporalio.bridge.worker.FixedSizeSlotSupplier(
+                        1
+                    ),
+                ),
+                nonsticky_to_sticky_poll_ratio=1,
+                no_remote_activities=True,
+                disable_payload_error_limit=True,
+                task_types=temporalio.bridge.worker.WorkerTaskTypes(
+                    enable_workflows=True,
+                    enable_local_activities=False,
+                    enable_remote_activities=False,
+                    enable_nexus=False,
+                ),
+                sticky_queue_schedule_to_start_timeout_millis=1000,
+                max_heartbeat_throttle_interval_millis=1000,
+                default_heartbeat_throttle_interval_millis=1000,
+                max_activities_per_second=None,
+                max_task_queue_activities_per_second=None,
+                max_eager_activity_reservations_per_workflow_task=3,
+                graceful_shutdown_period_millis=0,
+                versioning_strategy=temporalio.bridge.worker.WorkerVersioningStrategyNone(
+                    build_id_no_versioning=self._config.get("build_id")
+                    or load_default_build_id(),
+                ),
+                workflow_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
+                    2
+                ),
+                activity_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
+                    1
+                ),
+                nexus_task_poller_behavior=temporalio.bridge.worker.PollerBehaviorSimpleMaximum(
+                    1
+                ),
+                plugins=[(plugin.name(), plugin.version()) for plugin in self.plugins],
+                storage_drivers=storage_driver_types,
+            ),
+        )
+        return workflow_worker, bridge_worker, controller
 
 
 class ReplayerConfig(TypedDict, total=False):

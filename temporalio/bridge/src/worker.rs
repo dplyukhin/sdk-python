@@ -13,8 +13,14 @@ use temporalio_common::protos::coresdk::workflow_completion::WorkflowActivationC
 use temporalio_common::protos::coresdk::{
     nexus::NexusTaskCompletion, ActivityHeartbeat, ActivityTaskCompletion,
 };
-use temporalio_common::protos::temporal::api::history::v1::History;
+use temporalio_common::protos::temporal::api::history::v1::{
+    History, WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
+};
 use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDriverInfo};
+use temporalio_sdk_core::replay::{
+    checking::{init_checking_worker, CheckLimits, WorkflowCheck},
+    model::ModelHistory,
+};
 use temporalio_sdk_core::replay::{HistoryForReplay, ReplayWorkerInput};
 use temporalio_sdk_core::{
     PollError, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType, SlotMarkUsedContext,
@@ -22,6 +28,7 @@ use temporalio_sdk_core::{
     SlotSupplierPermit, WorkflowErrorType,
 };
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
@@ -538,6 +545,102 @@ pub fn new_replay_worker<'a>(
             history_pusher.into_pyobject(py)?.into_any(),
         ],
     )
+}
+
+pub fn new_checking_worker<'a>(
+    py: Python<'a>,
+    runtime_ref: &runtime::RuntimeRef,
+    config: WorkerConfig,
+) -> PyResult<Bound<'a, PyTuple>> {
+    enter_sync!(runtime_ref.runtime);
+    runtime_ref
+        .runtime
+        .assert_same_process("create checking worker")?;
+    let event_loop_task_locals = Arc::new(OnceLock::new());
+    let config = convert_worker_config(config, event_loop_task_locals.clone())?;
+    let (worker, checker) =
+        init_checking_worker(config).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let notifier = checker.eviction_notifier();
+    PyTuple::new(
+        py,
+        [
+            WorkerRef {
+                worker: Some(Arc::new(worker)),
+                event_loop_task_locals,
+                runtime: runtime_ref.runtime.clone(),
+            }
+            .into_pyobject(py)?
+            .into_any(),
+            WorkflowCheckRef {
+                checker: Arc::new(Mutex::new(Some(checker))),
+                notifier,
+                runtime: runtime_ref.runtime.clone(),
+            }
+            .into_pyobject(py)?
+            .into_any(),
+        ],
+    )
+}
+
+#[pyclass]
+pub struct WorkflowCheckRef {
+    checker: Arc<Mutex<Option<WorkflowCheck>>>,
+    notifier: Arc<Notify>,
+    runtime: runtime::Runtime,
+}
+
+#[pymethods]
+impl WorkflowCheckRef {
+    fn notify_eviction(&self) {
+        self.notifier.notify_one();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check<'p>(
+        &self,
+        py: Python<'p>,
+        workflow_id: String,
+        start: &[u8],
+        signals: Vec<Vec<u8>>,
+        max_depth: usize,
+        max_checks: usize,
+        timeout_millis: u64,
+        task_timeout_millis: u64,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        self.runtime.assert_same_process("check workflow")?;
+        let start = WorkflowExecutionStartedEventAttributes::decode(start)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let initial = ModelHistory::new(start, std::time::SystemTime::UNIX_EPOCH.into())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let signals = signals
+            .iter()
+            .map(|s| WorkflowExecutionSignaledEventAttributes::decode(s.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let checker = self.checker.clone();
+        self.runtime.future_into_py(py, async move {
+            let mut checker = checker
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("Workflow checker already used"))?;
+            let result = checker
+                .run(
+                    &workflow_id,
+                    initial,
+                    &signals,
+                    CheckLimits {
+                        max_depth,
+                        max_checks,
+                        timeout: Duration::from_millis(timeout_millis),
+                        task_timeout: Duration::from_millis(task_timeout_millis),
+                    },
+                )
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(result.map(|r| (r.history.encode_to_vec(), r.failure.encode_to_vec())))
+        })
+    }
 }
 
 #[pymethods]

@@ -60,6 +60,7 @@ fn temporal_sdk_bridge(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<worker::WorkerRef>()?;
     m.add_class::<worker::HistoryPusher>()?;
+    m.add_class::<worker::WorkflowCheckRef>()?;
     m.add_class::<worker::CustomSlotSupplier>()?;
     m.add_class::<worker::SlotReserveCtx>()?;
     m.add_class::<worker::SlotReleaseCtx>()?;
@@ -69,6 +70,7 @@ fn temporal_sdk_bridge(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<worker::LocalActivitySlotInfo>()?;
     m.add_function(wrap_pyfunction!(new_worker, m)?)?;
     m.add_function(wrap_pyfunction!(new_replay_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(new_checking_worker, m)?)?;
 
     // envconfig
     let envconfig_module = PyModule::new(py, "envconfig")?;
@@ -138,4 +140,13 @@ fn new_replay_worker<'a>(
     config: worker::WorkerConfig,
 ) -> PyResult<Bound<'a, PyTuple>> {
     worker::new_replay_worker(py, runtime_ref, config)
+}
+
+#[pyfunction]
+fn new_checking_worker<'a>(
+    py: Python<'a>,
+    runtime_ref: &runtime::RuntimeRef,
+    config: worker::WorkerConfig,
+) -> PyResult<Bound<'a, PyTuple>> {
+    worker::new_checking_worker(py, runtime_ref, config)
 }

@@ -200,6 +200,17 @@ class Worker:
         """Create SDK core worker from a bridge worker."""
         self._ref = ref
 
+    @staticmethod
+    def for_checking(
+        runtime: temporalio.bridge.runtime.Runtime,
+        config: WorkerConfig,
+    ) -> tuple[Worker, temporalio.bridge.temporal_sdk_bridge.WorkflowCheckRef]:
+        """Create a workflow checker using the normal activation interface."""
+        worker, checker = temporalio.bridge.temporal_sdk_bridge.new_checking_worker(
+            runtime._ref, config
+        )
+        return Worker(worker), checker
+
     async def validate(
         self,
     ) -> temporalio.bridge.proto.NamespaceInfo:
