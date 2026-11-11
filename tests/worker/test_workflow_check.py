@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import Any
@@ -14,6 +15,7 @@ import temporalio.bridge.proto.workflow_activation
 import temporalio.bridge.proto.workflow_completion
 import temporalio.bridge.worker
 import temporalio.client
+import temporalio.common
 import temporalio.converter
 import temporalio.testing
 import temporalio.testing._workflow_check
@@ -137,6 +139,147 @@ class ActivityOrderWorkflow:
 
         await asyncio.gather(resolve("first"), resolve("second"))
         assert order != ["second", "first"], "activity completion order"
+
+
+@temporalio.workflow.defn
+class OrderApprovalWorkflow:
+    stage_attribute: temporalio.common.SearchAttributeKey[str] = (
+        temporalio.common.SearchAttributeKey.for_keyword("OrderStage")
+    )
+
+    def __init__(self) -> None:
+        self.revoked: bool = False
+
+    def set_stage(self, stage: str) -> None:
+        temporalio.workflow.upsert_memo({"stage": stage})
+        temporalio.workflow.upsert_search_attributes(
+            [self.stage_attribute.value_set(stage)]
+        )
+        assert (
+            temporalio.workflow.info().typed_search_attributes[self.stage_attribute]
+            == stage
+        )
+
+    @temporalio.workflow.run
+    async def run(self, order_id: str) -> None:
+        temporalio.workflow.deprecate_patch("legacy-approval")
+        assert temporalio.workflow.patched("approval-v2")
+        temporalio.workflow.upsert_memo({"order_id": order_id, "scratch": True})
+        self.set_stage("pending")
+        approved = await temporalio.workflow.execute_activity(
+            forbidden_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        if not approved or self.revoked:
+            self.set_stage("rejected")
+            return
+        self.set_stage("approved")
+        temporalio.workflow.upsert_memo({"scratch": None})
+        assert temporalio.workflow.memo_value("order_id") == order_id
+        assert temporalio.workflow.memo_value("scratch", None) is None
+        await temporalio.workflow.sleep(timedelta(minutes=5))
+        assert not self.revoked, "revoked order dispatched"
+        self.set_stage("dispatched")
+
+    @temporalio.workflow.signal
+    def revoke(self) -> None:
+        self.revoked = True
+        self.set_stage("revoked")
+
+
+@pytest.mark.parametrize("max_depth, finds_failure", [(2, False), (3, True)])
+async def test_check_workflow_versioned_order_approval(
+    max_depth: int, finds_failure: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await temporalio.testing.WorkflowChecker(
+        workflows=[OrderApprovalWorkflow]
+    ).check_workflow(
+        OrderApprovalWorkflow.run,
+        "order-123",
+        signals=[
+            temporalio.testing.WorkflowCheckSignal(
+                OrderApprovalWorkflow.revoke, args=st.tuples()
+            )
+        ],
+        activities=[
+            temporalio.testing.WorkflowCheckActivity(
+                forbidden_activity, result=st.sampled_from([0, 1])
+            )
+        ],
+        samples_per_strategy=10,
+        max_depth=max_depth,
+        max_checks=100,
+    )
+    if not finds_failure:
+        assert result.history is None
+        assert result.exception is None
+        return
+    assert result.exception is not None
+    assert "revoked order dispatched" in str(result.exception)
+    assert result.history is not None
+    events = result.history.events
+    markers = [
+        json.loads(
+            e.marker_recorded_event_attributes.details["patch-data"].payloads[0].data
+        )
+        for e in events
+        if e.HasField("marker_recorded_event_attributes")
+    ]
+    assert markers == [
+        {"id": "legacy-approval", "deprecated": True},
+        {"id": "approval-v2", "deprecated": False},
+    ]
+    converter = temporalio.converter.DataConverter.default
+    memo_stages = []
+    indexed_stages = []
+    choices = []
+    for event in events:
+        if event.HasField("workflow_properties_modified_event_attributes"):
+            fields = (
+                event.workflow_properties_modified_event_attributes.upserted_memo.fields
+            )
+            if "stage" in fields:
+                memo_stages.extend(await converter.decode([fields["stage"]]))
+        elif event.HasField("upsert_workflow_search_attributes_event_attributes"):
+            fields = event.upsert_workflow_search_attributes_event_attributes.search_attributes.indexed_fields
+            if "OrderStage" in fields:
+                indexed_stages.extend(await converter.decode([fields["OrderStage"]]))
+        elif event.HasField("activity_task_completed_event_attributes"):
+            choices.append("approved")
+            assert await converter.decode(
+                event.activity_task_completed_event_attributes.result.payloads
+            ) == [1]
+        elif event.HasField("workflow_execution_signaled_event_attributes"):
+            choices.append("revoked")
+        elif event.HasField("timer_fired_event_attributes"):
+            choices.append("deadline")
+    assert choices == ["approved", "revoked", "deadline"]
+    assert memo_stages == indexed_stages == ["pending", "approved", "revoked"]
+
+    failures: list[str] = []
+    original = temporalio.bridge.worker.Worker.complete_workflow_activation
+
+    async def record_completion(
+        self: temporalio.bridge.worker.Worker,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+    ) -> None:
+        if completion.HasField("failed"):
+            failures.append(completion.failed.failure.message)
+        await original(self, completion)
+
+    monkeypatch.setattr(
+        temporalio.bridge.worker.Worker,
+        "complete_workflow_activation",
+        record_completion,
+    )
+    history = temporalio.client.WorkflowHistory.from_json(
+        result.history.workflow_id, result.history.to_json()
+    )
+    replay = await temporalio.worker.Replayer(
+        workflows=[OrderApprovalWorkflow]
+    ).replay_workflow(history, raise_on_replay_failure=False)
+    assert replay.replay_failure is None
+    assert any("revoked order dispatched" in failure for failure in failures)
 
 
 async def test_check_workflow_backtracks_and_returns_reproducible_history(

@@ -73,7 +73,8 @@ class WorkflowChecker:
 
     Uses the normal Core and Python workflow runners, with a fresh replay for
     each explored frontier. Supports timers, signals, successful remote activity
-    results, and terminal commands. Activity functions are never executed.
+    results, search attribute and memo updates, patch markers, and terminal
+    commands. Activity functions are never executed.
     Activity failures, timeouts, retries, cancellation, local activities, updates,
     child workflows, and continue-as-new are unsupported.
     Workflow failures are terminal outcomes; workflow-task failures and timeouts
